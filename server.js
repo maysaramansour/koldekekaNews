@@ -182,7 +182,22 @@ function parseGNewsTitle(raw) {
   return i > 0 ? { title: raw.slice(0, i).trim() } : { title: raw.trim() };
 }
 
-function makeId(item) { return item.guid || item.link || item.title || ''; }
+// Prefer canonical link over guid (guids in RT/Al Quds are numeric & unstable)
+function makeId(item) {
+  const raw = item.link || item.guid || item.title || '';
+  try {
+    const u = new URL(raw);
+    u.search = ''; u.hash = ''; // strip tracking params
+    return u.toString();
+  } catch (_) { return raw; }
+}
+
+// Normalize title for duplicate detection (strip punctuation, collapse spaces)
+function normTitle(title) {
+  return (title || '').replace(/[\u0600-\u06FF]/g, c => c) // keep arabic
+    .replace(/[^\w\u0600-\u06FF\s]/g, '')
+    .replace(/\s+/g, ' ').trim().toLowerCase();
+}
 
 function isArabicText(str) {
   const ar = (str || '').match(/[\u0600-\u06FF]/g) || [];
@@ -301,13 +316,18 @@ async function updateFeeds() {
   ]);
 
   let added = 0;
+  // Build title fingerprint set from existing articles to catch cross-feed dupes
+  const seenTitles = new Set([...articlesMap.values()].map(a => normTitle(a.title)));
+
   [...standardResults, ...blockedResults].forEach(result => {
     if (result.status === 'fulfilled') {
       result.value.forEach(article => {
-        if (article.id && !articlesMap.has(article.id)) {
-          articlesMap.set(article.id, article);
-          added++;
-        }
+        if (!article.id) return;
+        const nt = normTitle(article.title);
+        if (articlesMap.has(article.id) || seenTitles.has(nt)) return;
+        articlesMap.set(article.id, article);
+        seenTitles.add(nt);
+        added++;
       });
     }
   });

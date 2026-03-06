@@ -185,7 +185,27 @@ function parseGNewsTitle(raw) {
   return i > 0 ? {title: raw.slice(0, i).trim()} : {title: raw.trim()};
 }
 
-function makeId(item) { return item.guid || item.link || item.title || ""; }
+// Prefer canonical link over guid (guids in RT/Al Quds are numeric & unstable)
+function makeId(item) {
+  const raw = item.link || item.guid || item.title || "";
+  try {
+    const u = new URL(raw);
+    u.search = "";
+    u.hash = "";
+    return u.toString();
+  } catch (_) {
+    return raw;
+  }
+}
+
+// Normalize title for duplicate detection (strip punctuation, collapse spaces)
+function normTitle(title) {
+  return (title || "")
+      .replace(/[^\w\u0600-\u06FF\s]/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+}
 
 function isArabicText(str) {
   const ar = (str || "").match(/[\u0600-\u06FF]/g) || [];
@@ -342,14 +362,19 @@ async function updateFeeds() {
   ]);
   let added = 0;
   const newArticles = [];
+  // Build title fingerprints from existing articles to catch cross-feed dupes
+  const seenTitles = new Set([...articlesMap.values()].map((a) => normTitle(a.title)));
+
   [...standardResults, ...blockedResults].forEach((result) => {
     if (result.status === "fulfilled") {
       result.value.forEach((article) => {
-        if (article.id && !articlesMap.has(article.id)) {
-          articlesMap.set(article.id, article);
-          added++;
-          newArticles.push(article);
-        }
+        if (!article.id) return;
+        const nt = normTitle(article.title);
+        if (articlesMap.has(article.id) || seenTitles.has(nt)) return;
+        articlesMap.set(article.id, article);
+        seenTitles.add(nt);
+        added++;
+        newArticles.push(article);
       });
     }
   });
@@ -673,14 +698,21 @@ exports.newsNotifier = onSchedule(
       // Fetch all feeds fresh
       const results = await Promise.allSettled(FEEDS.map(fetchFeed));
       const allArticles = [];
+      const notifTitles = new Set();
       results.forEach((r) => {
         if (r.status === "fulfilled") allArticles.push(...r.value);
       });
 
-      // Find articles published AFTER last notified time
+      // Find articles published AFTER last notified time — dedupe by title
       const fresh = allArticles
           .filter((a) => new Date(a.pubDate) > lastNotifiedAt)
-          .sort((a, b) => new Date(b.pubDate) - new Date(a.pubDate));
+          .sort((a, b) => new Date(b.pubDate) - new Date(a.pubDate))
+          .filter((a) => {
+            const nt = normTitle(a.title);
+            if (notifTitles.has(nt)) return false;
+            notifTitles.add(nt);
+            return true;
+          });
 
       console.log(`[notifier] ${fresh.length} new articles since ${lastNotifiedAt.toISOString()}`);
 
