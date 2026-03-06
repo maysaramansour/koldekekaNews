@@ -27,7 +27,7 @@ class AdService {
       : 'ca-app-pub-3940256099942544/4411468910';  // iOS — replace when available
 
   static String get _nativeId => Platform.isAndroid
-      ? 'ca-app-pub-5971282809592096/8942958239'   // TODO: replace with real native unit
+      ? 'ca-app-pub-5971282809592096/2185978190'   // ✅ real native unit
       : 'ca-app-pub-3940256099942544/3986624511';  // iOS — replace when available
 
   // ── Initialise SDK ───────────────────────────────────────────────────────
