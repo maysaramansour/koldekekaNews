@@ -173,6 +173,38 @@ This updates the live API at `https://us-central1-kol-dekeka.cloudfunctions.net/
 
 ---
 
+## 🚀 "Go Live" Procedure
+
+When the user says **"go live"**, execute all of the following steps in order:
+
+1. **Commit all changes** to git with a descriptive message:
+   ```bash
+   git add -A
+   git commit -m "your message here\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+   ```
+
+2. **Push to GitHub**:
+   ```bash
+   git push origin main
+   ```
+
+3. **Deploy to Firebase Cloud Functions** (if `functions/index.js` was changed):
+   ```bash
+   firebase deploy --only functions
+   ```
+
+4. **Build and install Android APK** (if any Flutter files were changed):
+   ```bash
+   # Bump version in flutter_app/pubspec.yaml first (e.g. 1.0.0+2015 → 1.0.0+2016)
+   cd flutter_app
+   flutter build apk --release
+   ~/Library/Android/sdk/platform-tools/adb install -r build/app/outputs/flutter-apk/app-release.apk
+   ```
+
+> Always bump `version` in `pubspec.yaml` before installing to avoid `INSTALL_FAILED_VERSION_DOWNGRADE`.
+
+---
+
 ## Common Workflows
 
 ### Before committing Flutter changes
