@@ -13,19 +13,22 @@ import 'package:google_mobile_ads/google_mobile_ads.dart';
 class AdService {
   AdService._();
 
-  // ── Ad unit IDs ─────────────────────────────────────────────────────────
-  // TODO: replace with real ad unit IDs from AdMob before publishing
+  // ── Ad unit IDs (PRODUCTION) ─────────────────────────────────────────────
+  // App: كل دقيقة  |  ca-app-pub-5971282809592096~7841959124
+  //
+  // TODO: create Interstitial + Native units in AdMob and replace the
+  //       placeholder below with their real IDs.
   static String get _bannerId => Platform.isAndroid
-      ? 'ca-app-pub-3940256099942544/6300978111'   // Android test banner
-      : 'ca-app-pub-3940256099942544/2934735716';  // iOS test banner
+      ? 'ca-app-pub-5971282809592096/8942958239'   // ✅ real banner
+      : 'ca-app-pub-3940256099942544/2934735716';  // iOS — replace when available
 
   static String get _interstitialId => Platform.isAndroid
-      ? 'ca-app-pub-3940256099942544/1033173712'   // Android test interstitial
-      : 'ca-app-pub-3940256099942544/4411468910';  // iOS test interstitial
+      ? 'ca-app-pub-5971282809592096/7650387432'   // ✅ real interstitial
+      : 'ca-app-pub-3940256099942544/4411468910';  // iOS — replace when available
 
   static String get _nativeId => Platform.isAndroid
-      ? 'ca-app-pub-3940256099942544/2247696110'   // Android test native
-      : 'ca-app-pub-3940256099942544/3986624511';  // iOS test native
+      ? 'ca-app-pub-5971282809592096/8942958239'   // TODO: replace with real native unit
+      : 'ca-app-pub-3940256099942544/3986624511';  // iOS — replace when available
 
   // ── Initialise SDK ───────────────────────────────────────────────────────
   static Future<void> init() async {
