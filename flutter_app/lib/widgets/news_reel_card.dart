@@ -1,9 +1,11 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:google_mobile_ads/google_mobile_ads.dart';
 import 'package:share_plus/share_plus.dart';
 import '../models/article.dart';
 import '../screens/article_screen.dart';
+import '../services/ad_service.dart';
 import 'article_webview.dart';
 
 class NewsReelCard extends StatefulWidget {
@@ -29,6 +31,16 @@ class _NewsReelCardState extends State<NewsReelCard>
   late AnimationController _slideController;
   late Animation<Offset> _slideAnim;
   late Animation<double> _fadeAnim;
+
+  // Interstitial ad — preloaded, shown once when article is opened
+  InterstitialAd? _interstitial;
+  static int _articleOpenCount = 0; // show ad every 3 article opens
+
+  void _preloadInterstitial() {
+    AdService.loadInterstitial(onLoaded: (ad) {
+      _interstitial = ad;
+    });
+  }
   @override
   void initState() {
     super.initState();
@@ -52,6 +64,7 @@ class _NewsReelCardState extends State<NewsReelCard>
         if (mounted) _slideController.forward(from: 0);
       });
     }
+    _preloadInterstitial();
   }
 
   @override
@@ -65,6 +78,7 @@ class _NewsReelCardState extends State<NewsReelCard>
   @override
   void dispose() {
     _slideController.dispose();
+    _interstitial?.dispose();
     super.dispose();
   }
 
@@ -74,6 +88,29 @@ class _NewsReelCardState extends State<NewsReelCard>
       _isAr ? TextDirection.rtl : TextDirection.ltr;
 
   Future<void> _openArticle() async {
+    _articleOpenCount++;
+    // Show interstitial every 3 article opens
+    if (_articleOpenCount % 3 == 0 && _interstitial != null) {
+      _interstitial!.fullScreenContentCallback = FullScreenContentCallback(
+        onAdDismissedFullScreenContent: (ad) {
+          ad.dispose();
+          _interstitial = null;
+          _preloadInterstitial(); // preload next one
+          if (mounted) _navigateToArticle();
+        },
+        onAdFailedToShowFullScreenContent: (ad, _) {
+          ad.dispose();
+          _interstitial = null;
+          if (mounted) _navigateToArticle();
+        },
+      );
+      await _interstitial!.show();
+    } else {
+      _navigateToArticle();
+    }
+  }
+
+  void _navigateToArticle() {
     Navigator.push(
       context,
       PageRouteBuilder(

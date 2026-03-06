@@ -3,6 +3,7 @@ import 'package:google_fonts/google_fonts.dart';
 import '../models/video.dart';
 import '../services/video_service.dart';
 import '../services/video_stream_cache.dart';
+import '../widgets/banner_ad_widget.dart';
 import '../widgets/video_reel_card.dart';
 import '../widgets/live_pill.dart';
 import 'live_screen.dart';
@@ -118,6 +119,7 @@ class _VideoReelsScreenState extends State<VideoReelsScreen> {
 
     return Scaffold(
       backgroundColor: Colors.black,
+      bottomNavigationBar: const BannerAdWidget(),
       body: Stack(
         children: [
           _buildBody(),

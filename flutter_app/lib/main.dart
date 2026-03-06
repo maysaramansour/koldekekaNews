@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'screens/home_screen.dart';
+import 'services/ad_service.dart';
 import 'services/widget_service.dart';
 import 'widgets/perf_overlay.dart';
 
@@ -32,6 +33,9 @@ Future<void> main() async {
   // Firebase must init before runApp (other services use it)
   await Firebase.initializeApp();
   FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+
+  // Initialise AdMob SDK
+  await AdService.init();
 
   // Lock orientation then show UI immediately
   unawaited(SystemChrome.setPreferredOrientations([
