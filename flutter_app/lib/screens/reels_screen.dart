@@ -14,7 +14,7 @@ import '../widgets/native_ad_card.dart';
 import '../widgets/news_reel_card.dart';
 import '../widgets/source_filter.dart';
 import '../widgets/live_pill.dart';
-import 'live_screen.dart';
+import 'live_player_screen.dart';
 import 'settings_screen.dart';
 
 class ReelsScreen extends StatefulWidget {
@@ -85,6 +85,20 @@ class _ReelsScreenState extends State<ReelsScreen>
   // ── Data loading ──────────────────────────────────────────────────────────
 
   Future<void> _loadInitial() async {
+    // Stale-while-revalidate: show cached articles instantly, refresh in background
+    final cached = _newsService.cachedArticles;
+    if (cached.isNotEmpty) {
+      setState(() {
+        _articles = _filtered(cached);
+        _loading  = false;
+        _error    = null;
+        _page     = 1;
+      });
+      // Refresh silently in the background
+      _refresh();
+      return;
+    }
+
     setState(() {
       _loading = true;
       _error = null;
@@ -385,7 +399,12 @@ class _ReelsScreenState extends State<ReelsScreen>
                     LivePill(onTap: () => Navigator.push(
                       context,
                       MaterialPageRoute(
-                          builder: (_) => const LiveScreen()),
+                          builder: (_) => const LivePlayerScreen(
+                            channelId: '',
+                            channelName: 'العربية',
+                            channelColor: Color(0xFF884ea0),
+                            streamUrl: 'https://live.alarabiya.net/alarabiapublish/alarabiya.smil/playlist.m3u8',
+                          )),
                     )),
                     // Refresh
                     AnimatedBuilder(

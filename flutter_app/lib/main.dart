@@ -1,14 +1,47 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'models/article.dart';
+import 'screens/article_screen.dart';
 import 'screens/home_screen.dart';
 import 'services/ad_service.dart';
+import 'services/background_sync.dart';
 import 'services/widget_service.dart';
 import 'widgets/perf_overlay.dart';
+
+// Global navigator key so notification handlers can push routes
+final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
+
+// Stores notification data from terminated-state tap — consumed once the
+// navigator is mounted (avoids null-state race condition).
+Map<String, dynamic>? _pendingNotificationData;
+
+void _navigateToArticle(Map<String, dynamic> data) {
+  final link = data['link']?.toString() ?? '';
+  if (link.isEmpty) return;
+  final article = Article(
+    id: data['articleId']?.toString() ?? '',
+    title: data['title']?.toString() ?? data['source']?.toString() ?? '',
+    link: link,
+    description: '',
+    pubDate: DateTime.now(),
+    source: data['source']?.toString() ?? '',
+    color: '#2c3e50',
+    lang: 'ar',
+    image: null,
+    aiImage: false,
+    domain: '',
+    isNew: false,
+  );
+  _navigatorKey.currentState?.push(
+    MaterialPageRoute(builder: (_) => ArticleScreen(article: article)),
+  );
+}
 
 // ── Notification channel (Android) ───────────────────────────────────────────
 const AndroidNotificationChannel _channel = AndroidNotificationChannel(
@@ -34,14 +67,32 @@ Future<void> main() async {
   await Firebase.initializeApp();
   FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
 
+  // Handle notification tap when app is in background (resumed state)
+  FirebaseMessaging.onMessageOpenedApp.listen((msg) => _navigateToArticle(msg.data));
+
+  // ── Terminated-state notification tap ─────────────────────────────────────
+  // Must be retrieved BEFORE runApp so we have it ready before the navigator
+  // is built. We store it and navigate once the navigator is confirmed ready.
+  final initialMsg = await FirebaseMessaging.instance.getInitialMessage();
+  if (initialMsg != null && initialMsg.data['link']?.toString().isNotEmpty == true) {
+    _pendingNotificationData = initialMsg.data;
+  }
+
   // Initialise AdMob SDK
   await AdService.init();
+
+  // Background sync init (WorkManager)
+  await BackgroundSync.init();
 
   // Lock orientation then show UI immediately
   unawaited(SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
     DeviceOrientation.portraitDown,
   ]));
+
+  // Cap image cache to 40 MB / 80 images
+  PaintingBinding.instance.imageCache.maximumSize = 80;
+  PaintingBinding.instance.imageCache.maximumSizeBytes = 40 * 1024 * 1024;
 
   runApp(const ArabNewsApp());
 
@@ -61,7 +112,18 @@ Future<void> main() async {
       ),
       macOS: DarwinInitializationSettings(),
     );
-    await _localNotif.initialize(initSettings);
+    await _localNotif.initialize(
+      initSettings,
+      onDidReceiveNotificationResponse: (NotificationResponse response) {
+        final payload = response.payload;
+        if (payload != null && payload.isNotEmpty) {
+          try {
+            final data = jsonDecode(payload) as Map<String, dynamic>;
+            _navigateToArticle(data);
+          } catch (_) {}
+        }
+      },
+    );
 
     unawaited(_localNotif
         .resolvePlatformSpecificImplementation<
@@ -80,10 +142,19 @@ Future<void> main() async {
     // Subscribe to the topic the server publishes to
     await messaging.subscribeToTopic('news_updates');
 
+    // Register background periodic sync task
+    unawaited(BackgroundSync.register());
+
     // Show local notification when app is in the foreground
     FirebaseMessaging.onMessage.listen((RemoteMessage msg) {
       final n = msg.notification;
       if (n == null) return;
+      final payload = jsonEncode({
+        'articleId': msg.data['articleId'] ?? '',
+        'source': msg.data['source'] ?? n.title ?? '',
+        'link': msg.data['link'] ?? '',
+        'title': n.body ?? '',
+      });
       _localNotif.show(
         msg.hashCode,
         n.title ?? 'كل دقيقة',
@@ -99,8 +170,16 @@ Future<void> main() async {
           ),
           iOS: const DarwinNotificationDetails(),
         ),
+        payload: payload,
       );
     });
+
+    // Navigate for terminated-state tap — delayed to let the navigator settle
+    if (_pendingNotificationData != null) {
+      await Future.delayed(const Duration(milliseconds: 800));
+      _navigateToArticle(_pendingNotificationData!);
+      _pendingNotificationData = null;
+    }
   });
 }
 
@@ -152,6 +231,7 @@ class ArabNewsApp extends StatelessWidget {
       themeMode: ThemeMode.dark,
       theme: _theme,
       darkTheme: _theme,
+      navigatorKey: _navigatorKey,
       home: const PerfOverlay(child: HomeScreen()),
     );
   }

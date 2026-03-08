@@ -6,7 +6,7 @@ import '../services/video_stream_cache.dart';
 import '../widgets/banner_ad_widget.dart';
 import '../widgets/video_reel_card.dart';
 import '../widgets/live_pill.dart';
-import 'live_screen.dart';
+import 'live_player_screen.dart';
 
 class VideoReelsScreen extends StatefulWidget {
   final bool isActive;
@@ -24,7 +24,7 @@ class _VideoReelsScreenState extends State<VideoReelsScreen> {
   List<Map<String, dynamic>>   _channels    = [];
   String                       _selected    = 'all';
   int                          _current     = 0;
-  bool                         _loading     = true;
+  bool                         _loading     = false;
   bool                         _loadingMore = false;
   String?                      _error;
 
@@ -35,7 +35,20 @@ class _VideoReelsScreenState extends State<VideoReelsScreen> {
   @override
   void initState() {
     super.initState();
-    _load();
+    // Only load immediately if this tab is visible; otherwise defer to first activation
+    if (widget.isActive) {
+      _loading = true;
+      _load();
+    }
+  }
+
+  @override
+  void didUpdateWidget(VideoReelsScreen old) {
+    super.didUpdateWidget(old);
+    // Trigger load the first time this tab becomes active
+    if (widget.isActive && !old.isActive && _videos.isEmpty && !_loading) {
+      _load();
+    }
   }
 
   @override
@@ -46,6 +59,24 @@ class _VideoReelsScreenState extends State<VideoReelsScreen> {
 
   // ── Initial load (page 1) ─────────────────────────────────────────────────
   Future<void> _load() async {
+    // Stale-while-revalidate: show cached content immediately, then refresh
+    final cached = VideoService.cachedVideos;
+    final cachedCh = VideoService.cachedChannels;
+    if (cached != null && cached.isNotEmpty && VideoService.cachedChannel == _selected) {
+      setState(() {
+        _videos   = cached;
+        _channels = cachedCh ?? _channels;
+        _loading  = false;
+        _error    = null;
+        _current  = 0;
+      });
+      if (_pageController.hasClients) _pageController.jumpToPage(0);
+      VideoStreamCache.advanceTo(0, cached.map((v) => v.videoId).toList());
+      // Refresh in background — update list silently
+      _backgroundRefresh();
+      return;
+    }
+
     setState(() { _loading = true; _error = null; _page = 1; _hasMore = false; });
     try {
       final results = await Future.wait([
@@ -64,12 +95,36 @@ class _VideoReelsScreenState extends State<VideoReelsScreen> {
         _current     = 0;
       });
       if (_pageController.hasClients) _pageController.jumpToPage(0);
-      // Pre-warm stream URLs for first 3 in a background isolate
-      VideoStreamCache.warmUp(resp.videos.map((v) => v.videoId).toList(), from: 0, count: 3);
+      // Kick off URL prefetch + pre-init controller for video[1]
+      VideoStreamCache.advanceTo(0, resp.videos.map((v) => v.videoId).toList());
     } catch (e) {
       if (!mounted) return;
       setState(() { _loading = false; _error = e.toString(); });
     }
+  }
+
+  // ── Silent background refresh (stale-while-revalidate) ────────────────────
+  Future<void> _backgroundRefresh() async {
+    try {
+      final results = await Future.wait([
+        _service.fetchVideos(channel: _selected, page: 1),
+        _service.fetchChannels(),
+      ]);
+      if (!mounted) return;
+      final resp     = results[0] as VideoResponse;
+      final channels = results[1] as List<Map<String, dynamic>>;
+      final existingIds = {for (final v in _videos) v.videoId};
+      final hasNew = resp.videos.any((v) => !existingIds.contains(v.videoId));
+      if (hasNew) {
+        setState(() {
+          _videos   = resp.videos;
+          _channels = channels;
+          _page     = resp.page;
+          _hasMore  = resp.hasMore;
+        });
+        VideoStreamCache.advanceTo(_current, resp.videos.map((v) => v.videoId).toList());
+      }
+    } catch (_) {}
   }
 
   // ── Load next page (10 more videos) ──────────────────────────────────────
@@ -90,10 +145,9 @@ class _VideoReelsScreenState extends State<VideoReelsScreen> {
         _hasMore     = resp.hasMore;
         _loadingMore = false;
       });
-      // Pre-warm stream URLs for newly added videos
+      // Advance cache to current position with new videos available
       final allIds = _videos.map((v) => v.videoId).toList();
-      VideoStreamCache.warmUp(allIds,
-          from: _videos.length - newVideos.length, count: newVideos.length);
+      VideoStreamCache.advanceTo(_current, allIds);
     } catch (_) {
       if (!mounted) return;
       setState(() => _loadingMore = false);
@@ -103,13 +157,9 @@ class _VideoReelsScreenState extends State<VideoReelsScreen> {
   Future<void> _changeChannel(String ch) async {
     if (ch == _selected) return;
     VideoStreamCache.clear();
+    VideoService.clearCache();
     setState(() => _selected = ch);
     await _load();
-  }
-
-  void _prefetchAhead(int from, {int count = 3}) {
-    final ids = _videos.map((v) => v.videoId).toList();
-    VideoStreamCache.warmUp(ids, from: from, count: count);
   }
 
   @override
@@ -193,13 +243,11 @@ class _VideoReelsScreenState extends State<VideoReelsScreen> {
       itemCount: _videos.length + (_loadingMore ? 1 : 0),
       onPageChanged: (i) {
         setState(() => _current = i);
-        _prefetchAhead(i + 1, count: 3);
         final ids = _videos.map((v) => v.videoId).toList();
-        VideoStreamCache.evictDistant(i, ids);
+        // Prefetch URLs ahead + sequentially pre-init next controller
+        VideoStreamCache.advanceTo(i, ids);
         // Trigger next page when 5 from end
-        if (i >= _videos.length - 5) {
-          if (_hasMore) { _loadMore(); }
-        }
+        if (i >= _videos.length - 5 && _hasMore) _loadMore();
       },
       itemBuilder: (context, i) {
         // Loading spinner page at the end
@@ -227,7 +275,13 @@ class _VideoReelsScreenState extends State<VideoReelsScreen> {
   }
 
   // ── Header ─────────────────────────────────────────────────────────────────
-  Widget _buildHeader() => Positioned(
+  Widget _buildHeader() => ValueListenableBuilder<bool>(
+        valueListenable: VideoReelCard.fullscreenNotifier,
+        builder: (_, isFullscreen, __) =>
+            isFullscreen ? const SizedBox.shrink() : _buildHeaderContent(),
+      );
+
+  Widget _buildHeaderContent() => Positioned(
         top: 0, left: 0, right: 0,
         child: Container(
           decoration: const BoxDecoration(
@@ -268,7 +322,12 @@ class _VideoReelsScreenState extends State<VideoReelsScreen> {
                       LivePill(onTap: () => Navigator.push(
                         context,
                         MaterialPageRoute(
-                            builder: (_) => const LiveScreen()),
+                            builder: (_) => const LivePlayerScreen(
+                              channelId: '',
+                              channelName: 'العربية',
+                              channelColor: Color(0xFF884ea0),
+                              streamUrl: 'https://live.alarabiya.net/alarabiapublish/alarabiya.smil/playlist.m3u8',
+                            )),
                       )),
                       IconButton(
                         icon: const Icon(Icons.refresh_rounded,

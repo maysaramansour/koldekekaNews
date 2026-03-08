@@ -21,6 +21,21 @@ class VideoService {
 
   static String get serverBase => _overrideBase ?? _defaultBase;
 
+  // ── In-memory cache ────────────────────────────────────────────────────────
+  static List<Video>? _cachedVideos;
+  static List<Map<String, dynamic>>? _cachedChannels;
+  static String _cachedChannel = 'all';
+
+  static List<Video>? get cachedVideos => _cachedVideos;
+  static List<Map<String, dynamic>>? get cachedChannels => _cachedChannels;
+  static String get cachedChannel => _cachedChannel;
+
+  static void clearCache() {
+    _cachedVideos = null;
+    _cachedChannels = null;
+    _cachedChannel = 'all';
+  }
+
   Future<VideoResponse> fetchVideos({
     String channel = 'all',
     int page = 1,
@@ -33,14 +48,21 @@ class VideoService {
     final resp = await http.get(uri).timeout(const Duration(seconds: 15));
     if (resp.statusCode != 200) throw Exception('Server error ${resp.statusCode}');
     final data = await compute(_parseVideoBytes, resp.bodyBytes);
-    return VideoResponse.fromJson(data);
+    final result = VideoResponse.fromJson(data);
+    // Cache page-1 results for stale-while-revalidate
+    if (page == 1) {
+      _cachedVideos = result.videos;
+      _cachedChannel = channel;
+    }
+    return result;
   }
 
   Future<List<Map<String, dynamic>>> fetchChannels() async {
     final uri = Uri.parse('$serverBase/api/video-channels');
     final resp = await http.get(uri).timeout(const Duration(seconds: 10));
-    if (resp.statusCode != 200) return [];
+    if (resp.statusCode != 200) return _cachedChannels ?? [];
     final data = await compute(_parseChannelsBytes, resp.bodyBytes);
-    return data.cast<Map<String, dynamic>>();
+    _cachedChannels = data.cast<Map<String, dynamic>>();
+    return _cachedChannels!;
   }
 }
