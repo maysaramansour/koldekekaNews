@@ -1,126 +1,139 @@
 import 'package:video_player/video_player.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart' hide Video;
 
-/// Caches resolved YouTube stream URLs **and** pre-initialized
-/// [VideoPlayerController]s so videos play instantly.
+/// Manages YouTube stream URL resolution and sequential controller pre-init.
 ///
-/// Key design: [_futures] stores the in-flight Future for each videoId so
-/// any number of callers awaiting the same ID share one network request.
+/// Strategy:
+///   - URL cache: resolve up to 4 videos ahead (strings only, cheap).
+///   - Controller cache: pre-init exactly ONE controller at a time (the next
+///     video). Sequential — never two controller inits running in parallel.
+///   - When user advances to video N, the controller for N+1 starts pre-init.
+///   - Result: instant play for every video, max ~1 extra controller in RAM.
 class VideoStreamCache {
   VideoStreamCache._();
 
-  // ── Shared YoutubeExplode instance ───────────────────────────────────────────
   static final YoutubeExplode _yt = YoutubeExplode();
 
-  // ── URL cache ────────────────────────────────────────────────────────────────
+  // ── URL cache (lightweight — just strings) ────────────────────────────────
   static final Map<String, String>       _urls    = {};
-  // In-flight Futures — deduplicates parallel callers for the same videoId
   static final Map<String, Future<void>> _futures = {};
 
-  // ── Controller cache ─────────────────────────────────────────────────────────
+  // ── Controller cache — at most 1 entry at a time ──────────────────────────
   static final Map<String, VideoPlayerController> _controllers = {};
-  static final Set<String>                         _initingCtrl = {};
+  static bool _ctrlBusy = false; // ensures sequential init
 
-  /// Returns a cached stream URL, or `null` if not yet resolved.
+  // ── URL resolution ────────────────────────────────────────────────────────
+
   static String? get(String videoId) => _urls[videoId];
 
-  /// Takes ownership of a pre-initialized controller (removes it from cache).
-  /// Returns `null` if none is ready yet.
-  static VideoPlayerController? takeController(String videoId) =>
-      _controllers.remove(videoId);
-
-  /// Ensures the stream URL for [videoId] is resolved, then returns it.
-  /// If a fetch is already in progress, awaits that same Future (no duplicate
-  /// network request). Returns `null` on failure.
+  /// Resolves and returns the stream URL, awaiting any in-flight fetch.
   static Future<String?> ensureUrl(String videoId) async {
     if (_urls.containsKey(videoId)) return _urls[videoId];
-    // Reuse or create the in-flight Future
     _futures[videoId] ??= _fetchUrl(videoId);
     await _futures[videoId];
     return _urls[videoId];
   }
 
-  /// Starts background prefetch for [videoId] without awaiting.
-  /// Subsequent calls for the same ID are no-ops (Future is reused).
-  static void prefetch(String videoId) {
-    if (_urls.containsKey(videoId)) {
-      // URL ready — kick off controller pre-init if not done
-      _preInitController(videoId);
-      return;
-    }
-    _futures[videoId] ??= _fetchUrl(videoId);
+  static void _prefetch(String videoId) {
+    if (_urls.containsKey(videoId) || _futures.containsKey(videoId)) return;
+    _futures[videoId] = _fetchUrl(videoId);
   }
 
   static Future<void> _fetchUrl(String videoId) async {
     try {
       final manifest = await _yt.videos.streamsClient.getManifest(videoId);
-      final muxed    = manifest.muxed;
+      // Sort by resolution height (desc) then bitrate (desc) — highest quality first.
+      // Muxed streams are capped at 720p by YouTube; this ensures we get that max.
+      final muxed = manifest.muxed.toList()
+        ..sort((a, b) {
+          final hDiff = b.videoResolution.height.compareTo(a.videoResolution.height);
+          return hDiff != 0 ? hDiff : b.bitrate.bitsPerSecond.compareTo(a.bitrate.bitsPerSecond);
+        });
       if (muxed.isNotEmpty) {
-        _urls[videoId] = muxed.withHighestBitrate().url.toString();
-        _preInitController(videoId); // fire-and-forget
+        _urls[videoId] = muxed.first.url.toString();
       }
     } catch (_) {
-      // Ignored — card retries on-demand
     } finally {
       _futures.remove(videoId);
     }
   }
 
+  // ── Controller pre-init (sequential) ─────────────────────────────────────
+
+  /// Takes ownership of a pre-initialized controller. Returns null if not ready.
+  static VideoPlayerController? takeController(String videoId) =>
+      _controllers.remove(videoId);
+
+  /// Pre-initializes the controller for [videoId] if nothing else is running.
+  /// Fire-and-forget — safe to call without await.
   static Future<void> _preInitController(String videoId) async {
-    if (_controllers.containsKey(videoId) || _initingCtrl.contains(videoId)) return;
+    if (_controllers.containsKey(videoId) || _ctrlBusy) return;
     final url = _urls[videoId];
-    if (url == null) return;
-    _initingCtrl.add(videoId);
+    if (url == null) {
+      // URL not ready yet — wait for it first
+      await _fetchUrl(videoId);
+      if (!_urls.containsKey(videoId)) return;
+    }
+    if (_ctrlBusy || _controllers.containsKey(videoId)) return;
+    _ctrlBusy = true;
     try {
       final ctrl = VideoPlayerController.networkUrl(
-        Uri.parse(url),
+        Uri.parse(_urls[videoId]!),
         videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true),
       );
       await ctrl.initialize();
       if (_controllers.containsKey(videoId)) {
-        ctrl.dispose(); // race: card already owns one
+        // Race: another path already took it — discard
+        ctrl.dispose();
       } else {
         _controllers[videoId] = ctrl;
       }
     } catch (_) {
-      // Card falls back to on-demand init
     } finally {
-      _initingCtrl.remove(videoId);
+      _ctrlBusy = false;
     }
   }
 
-  /// Fires prefetch for ALL [videoIds] in parallel immediately.
-  /// Call this as soon as the video list is available.
-  static void warmUpAll(List<String> videoIds) {
-    for (final id in videoIds) {
-      prefetch(id);
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
+
+  /// Call whenever the user lands on [currentIndex].
+  /// Prefetches URLs 4 ahead and pre-inits the controller for the next video.
+  static void advanceTo(int currentIndex, List<String> videoIds) {
+    // Prefetch URLs for next 4 videos (just string resolution, cheap)
+    for (int i = currentIndex + 1;
+        i <= currentIndex + 4 && i < videoIds.length;
+        i++) {
+      _prefetch(videoIds[i]);
+    }
+
+    // Evict pre-initialized controllers that are no longer the "next" video
+    final keepId =
+        currentIndex + 1 < videoIds.length ? videoIds[currentIndex + 1] : null;
+    _controllers.removeWhere((id, ctrl) {
+      if (id == keepId) return false;
+      ctrl.dispose();
+      return true;
+    });
+
+    // Evict URLs that are too far behind (> 5 away) to bound string cache
+    for (int i = 0; i < currentIndex - 5 && i < videoIds.length; i++) {
+      _urls.remove(videoIds[i]);
+    }
+
+    // Pre-init the next video's controller (sequential — skips if busy)
+    if (keepId != null) {
+      _preInitController(keepId);
     }
   }
 
-  /// Warms up [count] videos starting at [from].
-  static void warmUp(List<String> videoIds, {int from = 0, int count = 3}) {
-    for (int i = from; i < from + count && i < videoIds.length; i++) {
-      prefetch(videoIds[i]);
-    }
-  }
-
-  /// Disposes controllers more than [window] pages away to free memory.
-  static void evictDistant(int currentIndex, List<String> videoIds, {int window = 2}) {
-    for (int i = 0; i < videoIds.length; i++) {
-      if ((i - currentIndex).abs() > window) {
-        final id = videoIds[i];
-        _controllers.remove(id)?.dispose();
-        _initingCtrl.remove(id);
-      }
-    }
-  }
-
-  /// Clears everything (e.g. when channel filter changes).
+  /// Clears everything (e.g. on channel filter change).
   static void clear() {
-    for (final ctrl in _controllers.values) { ctrl.dispose(); }
+    for (final ctrl in _controllers.values) {
+      ctrl.dispose();
+    }
     _controllers.clear();
-    _initingCtrl.clear();
     _urls.clear();
     _futures.clear();
+    _ctrlBusy = false;
   }
 }

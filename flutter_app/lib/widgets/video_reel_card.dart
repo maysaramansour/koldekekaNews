@@ -1,9 +1,13 @@
+import 'dart:async';
+
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import '../models/video.dart';
 import '../services/video_stream_cache.dart';
 
@@ -21,6 +25,9 @@ class VideoReelCard extends StatefulWidget {
     required this.totalPages,
   });
 
+  /// Global fullscreen state — HomeScreen & VideoReelsScreen listen to this.
+  static final ValueNotifier<bool> fullscreenNotifier = ValueNotifier(false);
+
   @override
   State<VideoReelCard> createState() => _VideoReelCardState();
 }
@@ -36,7 +43,23 @@ class _VideoReelCardState extends State<VideoReelCard>
   VideoPlayerController? _ctrl;
   bool _loadingStream = false;
   bool _streamError   = false;
-  bool _showControls  = true;
+
+  // ── Pinch-to-zoom ──────────────────────────────────────────────────────────
+  double _scale = 1.0;
+  double _baseScale = 1.0;
+
+  // ── Tap-to-pause flash ─────────────────────────────────────────────────────
+  bool _showPauseIcon = false;
+  Timer? _pauseIconTimer;
+
+  // ── Fullscreen ─────────────────────────────────────────────────────────────
+  bool _isFullscreen = false;
+
+  // ── Seekbar ────────────────────────────────────────────────────────────────
+  Duration _position = Duration.zero;
+  Duration _duration = Duration.zero;
+  bool _showSeekBar  = false;
+  Timer? _seekBarTimer;
 
   @override
   void initState() {
@@ -61,8 +84,10 @@ class _VideoReelCardState extends State<VideoReelCard>
         state == AppLifecycleState.inactive ||
         state == AppLifecycleState.detached) {
       _ctrl?.pause();
+      WakelockPlus.disable();
     } else if (state == AppLifecycleState.resumed && widget.isActive) {
       _ctrl?.play();
+      WakelockPlus.enable();
     }
   }
 
@@ -78,15 +103,30 @@ class _VideoReelCardState extends State<VideoReelCard>
       }
     } else if (!widget.isActive && old.isActive) {
       _ctrl?.pause();
+      WakelockPlus.disable();
+    }
+  }
+
+  void _onVideoProgress() {
+    if (!mounted || _ctrl == null) return;
+    final pos = _ctrl!.value.position;
+    final dur = _ctrl!.value.duration;
+    if (pos != _position || dur != _duration) {
+      setState(() { _position = pos; _duration = dur; });
     }
   }
 
   @override
   void dispose() {
+    _pauseIconTimer?.cancel();
+    _seekBarTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
+    _ctrl?.removeListener(_onVideoProgress);
     _ctrl?.pause();
     _slideCtrl.dispose();
     _ctrl?.dispose();
+    WakelockPlus.disable();
+    if (_isFullscreen) _exitFullscreen();
     super.dispose();
   }
 
@@ -95,16 +135,19 @@ class _VideoReelCardState extends State<VideoReelCard>
     setState(() { _loadingStream = true; _streamError = false; });
 
     try {
-      // Try to take a pre-initialized controller from the cache first
+      // Take pre-initialized controller if ready (instant play)
       final cached = VideoStreamCache.takeController(widget.video.videoId);
       if (cached != null) {
         if (!mounted) { cached.dispose(); return; }
         setState(() { _ctrl = cached; _loadingStream = false; });
+        _ctrl!.addListener(_onVideoProgress);
+        _ctrl!.setLooping(true);
         _ctrl!.play();
+        WakelockPlus.enable();
         return;
       }
 
-      // Otherwise resolve the URL (may already be cached or in-flight)
+      // Otherwise resolve URL (should already be cached) then init on-demand
       final url = await VideoStreamCache.ensureUrl(widget.video.videoId);
       if (!mounted) return;
       if (url == null) {
@@ -119,8 +162,10 @@ class _VideoReelCardState extends State<VideoReelCard>
       await ctrl.initialize();
       if (!mounted) { ctrl.dispose(); return; }
       setState(() { _ctrl = ctrl; _loadingStream = false; });
+      ctrl.addListener(_onVideoProgress);
       ctrl.setLooping(true);
       ctrl.play();
+      WakelockPlus.enable();
     } catch (_) {
       if (!mounted) return;
       setState(() { _loadingStream = false; _streamError = true; });
@@ -135,13 +180,63 @@ class _VideoReelCardState extends State<VideoReelCard>
         ShareParams(text: '${widget.video.title}\n\n${widget.video.youtubeUrl}',
             subject: widget.video.title));
 
-  void _toggleControls() => setState(() => _showControls = !_showControls);
-
   void _togglePlay() {
     if (_ctrl == null) return;
     setState(() {
-      _ctrl!.value.isPlaying ? _ctrl!.pause() : _ctrl!.play();
+      if (_ctrl!.value.isPlaying) {
+        _ctrl!.pause();
+        WakelockPlus.disable();
+      } else {
+        _ctrl!.play();
+        WakelockPlus.enable();
+      }
+      _showPauseIcon = true;
     });
+    _pauseIconTimer?.cancel();
+    _pauseIconTimer = Timer(const Duration(milliseconds: 700), () {
+      if (mounted) setState(() => _showPauseIcon = false);
+    });
+    // In fullscreen, also show the seekbar briefly
+    if (_isFullscreen) _showSeekBarBriefly();
+  }
+
+  void _showSeekBarBriefly() {
+    setState(() => _showSeekBar = true);
+    _seekBarTimer?.cancel();
+    _seekBarTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) setState(() => _showSeekBar = false);
+    });
+  }
+
+  void _enterFullscreen() {
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    setState(() { _isFullscreen = true; _scale = 1.0; });
+    VideoReelCard.fullscreenNotifier.value = true;
+    _showSeekBarBriefly();
+  }
+
+  void _exitFullscreen() {
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+    ]);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    setState(() { _isFullscreen = false; _showSeekBar = false; });
+    VideoReelCard.fullscreenNotifier.value = false;
+  }
+
+  void _toggleFullscreen() =>
+      _isFullscreen ? _exitFullscreen() : _enterFullscreen();
+
+  String _formatDuration(Duration d) {
+    final h = d.inHours;
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return h > 0 ? '$h:$m:$s' : '$m:$s';
   }
 
   // ── Build ──────────────────────────────────────────────────────────────────
@@ -154,16 +249,83 @@ class _VideoReelCardState extends State<VideoReelCard>
       width: size.width,
       height: size.height,
       child: GestureDetector(
-        onTap: _toggleControls,
+        onTap: () {
+          _showSeekBarBriefly();
+          _togglePlay();
+        },
+        onScaleStart: (_) => _baseScale = _scale,
+        onScaleUpdate: (d) {
+          if (d.pointerCount < 2 || _isFullscreen) return;
+          setState(() => _scale = (_baseScale * d.scale).clamp(1.0, 4.0));
+        },
+        onScaleEnd: (_) {
+          if (_scale < 1.1) setState(() => _scale = 1.0);
+        },
         child: Stack(
           fit: StackFit.expand,
           children: [
-            _buildVideoOrThumb(video),
-            _buildGradient(),
-            _buildContent(video),
-            _buildSidebar(),
-            _buildProgressBar(),
-            if (_showControls) _buildPlayPauseOverlay(),
+            // Video / thumbnail
+            Transform.scale(
+              scale: _isFullscreen ? 1.0 : _scale,
+              child: _buildVideoOrThumb(video),
+            ),
+
+            // Normal mode overlays (hidden in fullscreen)
+            if (!_isFullscreen && _scale <= 1.0) ...[
+              _buildGradient(),
+              _buildContent(video),
+              _buildSidebar(),
+              _buildProgressBar(),
+            ],
+
+            // Brief pause/play flash
+            if (_showPauseIcon)
+              Center(
+                child: Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: const BoxDecoration(
+                    color: Colors.black45,
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(
+                    (_ctrl?.value.isPlaying ?? false)
+                        ? Icons.play_arrow_rounded
+                        : Icons.pause_rounded,
+                    color: Colors.white,
+                    size: 52,
+                  ),
+                ),
+              ),
+
+            // Portrait seekbar (shown briefly on tap)
+            if (!_isFullscreen && _showSeekBar && _duration > Duration.zero)
+              _buildPortraitSeekBar(),
+
+            // Fullscreen UI: exit button + seekbar
+            if (_isFullscreen) ...[
+              // Exit fullscreen button (top-left)
+              Positioned(
+                top: 16,
+                left: 16,
+                child: SafeArea(
+                  child: GestureDetector(
+                    onTap: _exitFullscreen,
+                    child: Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: const BoxDecoration(
+                        color: Colors.black45,
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(Icons.fullscreen_exit_rounded,
+                          color: Colors.white, size: 26),
+                    ),
+                  ),
+                ),
+              ),
+
+              // Seekbar (shown briefly on tap)
+              if (_showSeekBar) _buildSeekBar(),
+            ],
           ],
         ),
       ),
@@ -175,6 +337,16 @@ class _VideoReelCardState extends State<VideoReelCard>
     if (_streamError) return _buildErrorOverlay(video);
 
     if (_ctrl != null && _ctrl!.value.isInitialized) {
+      if (_isFullscreen) {
+        // Fullscreen: fill the landscape width at native aspect ratio (no crop)
+        return Center(
+          child: AspectRatio(
+            aspectRatio: _ctrl!.value.aspectRatio,
+            child: VideoPlayer(_ctrl!),
+          ),
+        );
+      }
+      // Portrait: cover the full card (crop as needed)
       return FittedBox(
         fit: BoxFit.cover,
         child: SizedBox(
@@ -288,36 +460,6 @@ class _VideoReelCardState extends State<VideoReelCard>
           ),
         ],
       );
-
-  // ── Play/pause overlay ─────────────────────────────────────────────────────
-  Widget _buildPlayPauseOverlay() {
-    if (_ctrl == null || !_ctrl!.value.isInitialized) return const SizedBox();
-    final playing = _ctrl!.value.isPlaying;
-    return Positioned.fill(
-      child: Align(
-        alignment: Alignment.center,
-        child: GestureDetector(
-          onTap: _togglePlay,
-          child: AnimatedOpacity(
-            opacity: _showControls ? 1.0 : 0.0,
-            duration: const Duration(milliseconds: 200),
-            child: Container(
-              padding: const EdgeInsets.all(16),
-              decoration: const BoxDecoration(
-                color: Colors.black38,
-                shape: BoxShape.circle,
-              ),
-              child: Icon(
-                playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                color: Colors.white,
-                size: 48,
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
 
   // ── Gradient ───────────────────────────────────────────────────────────────
   Widget _buildGradient() => DecoratedBox(
@@ -436,6 +578,141 @@ class _VideoReelCardState extends State<VideoReelCard>
         ),
       );
 
+  // ── Seekbar (portrait) ────────────────────────────────────────────────────
+  Widget _buildPortraitSeekBar() {
+    final dur = _duration.inMilliseconds.toDouble();
+    final pos = _position.inMilliseconds.toDouble().clamp(0.0, dur == 0 ? 1.0 : dur);
+    final progress = dur > 0 ? pos / dur : 0.0;
+
+    return Positioned(
+      bottom: 0,
+      left: 0,
+      right: 0,
+      child: SafeArea(
+        top: false,
+        child: Directionality(
+          textDirection: TextDirection.rtl,
+          child: Container(
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.bottomCenter,
+                end: Alignment.topCenter,
+                colors: [Colors.black87, Colors.transparent],
+              ),
+            ),
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+            child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(_formatDuration(_duration),
+                      style: const TextStyle(
+                          color: Colors.white54, fontSize: 11)),
+                  Text(_formatDuration(_position),
+                      style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold)),
+                ],
+              ),
+              SliderTheme(
+                data: SliderTheme.of(context).copyWith(
+                  trackHeight: 2,
+                  thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                  overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
+                  activeTrackColor: Colors.white,
+                  inactiveTrackColor: Colors.white30,
+                  thumbColor: Colors.white,
+                  overlayColor: Colors.white24,
+                ),
+                child: Slider(
+                  value: progress.clamp(0.0, 1.0),
+                  onChangeStart: (_) => _seekBarTimer?.cancel(),
+                  onChanged: (val) {
+                    final newPos = Duration(
+                        milliseconds: (val * _duration.inMilliseconds).toInt());
+                    setState(() => _position = newPos);
+                    _ctrl?.seekTo(newPos);
+                  },
+                  onChangeEnd: (_) => _showSeekBarBriefly(),
+                ),
+              ),
+            ],
+          ),
+        ),
+        ),
+      ),
+    );
+  }
+
+  // ── Seekbar (fullscreen) ───────────────────────────────────────────────────
+  Widget _buildSeekBar() {
+    final dur = _duration.inMilliseconds.toDouble();
+    final pos = _position.inMilliseconds.toDouble().clamp(0.0, dur == 0 ? 1.0 : dur);
+    final progress = dur > 0 ? pos / dur : 0.0;
+
+    return Positioned(
+      bottom: 24,
+      left: 16,
+      right: 16,
+      child: SafeArea(
+        child: Directionality(
+          textDirection: TextDirection.rtl,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Time labels: right = current, left = total (RTL)
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    _formatDuration(_duration),
+                    style: const TextStyle(color: Colors.white54, fontSize: 12),
+                  ),
+                  Text(
+                    _formatDuration(_position),
+                    style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              SliderTheme(
+                data: SliderTheme.of(context).copyWith(
+                  trackHeight: 3,
+                  thumbShape: const RoundSliderThumbShape(
+                      enabledThumbRadius: 7),
+                  overlayShape: const RoundSliderOverlayShape(
+                      overlayRadius: 14),
+                  activeTrackColor: Colors.white,
+                  inactiveTrackColor: Colors.white30,
+                  thumbColor: Colors.white,
+                  overlayColor: Colors.white24,
+                ),
+                child: Slider(
+                  value: progress.clamp(0.0, 1.0),
+                  onChangeStart: (_) => _seekBarTimer?.cancel(),
+                  onChanged: (val) {
+                    final newPos = Duration(
+                      milliseconds: (val * _duration.inMilliseconds).toInt(),
+                    );
+                    setState(() => _position = newPos);
+                    _ctrl?.seekTo(newPos);
+                  },
+                  onChangeEnd: (_) => _showSeekBarBriefly(),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   // ── Sidebar ────────────────────────────────────────────────────────────────
   Widget _buildSidebar() => Positioned(
         right: 8,
@@ -451,6 +728,13 @@ class _VideoReelCardState extends State<VideoReelCard>
                   icon: Icons.share_rounded,
                   label: _isAr ? 'مشاركة' : 'Share',
                   onTap: _share),
+              const SizedBox(height: 20),
+              _sideBtn(
+                  icon: _isFullscreen
+                      ? Icons.fullscreen_exit_rounded
+                      : Icons.fullscreen_rounded,
+                  label: _isFullscreen ? 'تصغير' : 'ملء الشاشة',
+                  onTap: _toggleFullscreen),
             ],
           ),
         ),

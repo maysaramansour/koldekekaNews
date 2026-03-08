@@ -6,12 +6,15 @@ import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 import '../models/article.dart';
+import '../services/ad_service.dart';
 import '../services/news_service.dart';
 import '../services/widget_service.dart';
+import '../widgets/banner_ad_widget.dart';
+import '../widgets/native_ad_card.dart';
 import '../widgets/news_reel_card.dart';
 import '../widgets/source_filter.dart';
 import '../widgets/live_pill.dart';
-import 'live_screen.dart';
+import 'live_player_screen.dart';
 import 'settings_screen.dart';
 
 class ReelsScreen extends StatefulWidget {
@@ -82,6 +85,20 @@ class _ReelsScreenState extends State<ReelsScreen>
   // ── Data loading ──────────────────────────────────────────────────────────
 
   Future<void> _loadInitial() async {
+    // Stale-while-revalidate: show cached articles instantly, refresh in background
+    final cached = _newsService.cachedArticles;
+    if (cached.isNotEmpty) {
+      setState(() {
+        _articles = _filtered(cached);
+        _loading  = false;
+        _error    = null;
+        _page     = 1;
+      });
+      // Refresh silently in the background
+      _refresh();
+      return;
+    }
+
     setState(() {
       _loading = true;
       _error = null;
@@ -256,6 +273,8 @@ class _ReelsScreenState extends State<ReelsScreen>
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
+      // Banner ad anchored at the bottom
+      bottomNavigationBar: const BannerAdWidget(),
       body: Stack(
         children: [
           _buildBody(),
@@ -271,6 +290,10 @@ class _ReelsScreenState extends State<ReelsScreen>
     if (_error != null) return _buildError();
     if (_articles.isEmpty) return _buildEmpty();
 
+    // Inject native ad sentinels every 8 articles
+    final injected = AdService.injectAdSlots(_articles);
+    final totalItems = injected.length + (_loadingMore ? 1 : 0);
+
     return RefreshIndicator(
       onRefresh: _refresh,
       color: Colors.white,
@@ -280,15 +303,17 @@ class _ReelsScreenState extends State<ReelsScreen>
         scrollDirection: Axis.vertical,
         physics: const ClampingScrollPhysics(),
         onPageChanged: (i) {
-          _pageNotifier.value = i; // no setState — only cards re-evaluate isActive
-          if (i >= _articles.length - 10) {
+          _pageNotifier.value = i;
+          // Trigger load-more when close to the real article list end
+          if (i >= injected.length - 10) {
             if (_hasMore) { _loadMore(); }
             else { _silentRefresh(); }
           }
         },
-        itemCount: _articles.length + (_loadingMore ? 1 : 0),
+        itemCount: totalItems,
         itemBuilder: (context, i) {
-          if (i == _articles.length) {
+          // Loading spinner at very end
+          if (i == injected.length) {
             return const Center(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -301,7 +326,12 @@ class _ReelsScreenState extends State<ReelsScreen>
               ),
             );
           }
-          final article = _articles[i];
+          final item = injected[i];
+          // Native ad slot
+          if (item == AdService.adSentinel) {
+            return const Center(child: NativeAdCard());
+          }
+          final article = item as Article;
           return RepaintBoundary(
             child: ValueListenableBuilder<int>(
               valueListenable: _pageNotifier,
@@ -369,7 +399,12 @@ class _ReelsScreenState extends State<ReelsScreen>
                     LivePill(onTap: () => Navigator.push(
                       context,
                       MaterialPageRoute(
-                          builder: (_) => const LiveScreen()),
+                          builder: (_) => const LivePlayerScreen(
+                            channelId: '',
+                            channelName: 'العربية',
+                            channelColor: Color(0xFF884ea0),
+                            streamUrl: 'https://live.alarabiya.net/alarabiapublish/alarabiya.smil/playlist.m3u8',
+                          )),
                     )),
                     // Refresh
                     AnimatedBuilder(

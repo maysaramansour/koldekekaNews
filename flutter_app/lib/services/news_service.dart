@@ -44,7 +44,7 @@ class NewsService {
     String source = 'all',
     bool forceRefresh = false,
     int page = 1,
-    int limit = 90,
+    int limit = 30,
   }) async {
     final since =
         (!forceRefresh && _lastFetchedAt != null && page == 1) ? _lastFetchedAt : 0;
@@ -73,6 +73,10 @@ class NewsService {
           .toList();
       _cachedArticles = [...newOnes, ..._cachedArticles];
       _cachedArticles.sort((a, b) => b.pubDate.compareTo(a.pubDate));
+      // Cap cache to prevent unbounded growth
+      if (_cachedArticles.length > 120) {
+        _cachedArticles = _cachedArticles.sublist(0, 120);
+      }
       _lastFetchedAt = newsResponse.lastUpdated;
     }
 

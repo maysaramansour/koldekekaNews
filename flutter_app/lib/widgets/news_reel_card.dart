@@ -1,9 +1,12 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:google_mobile_ads/google_mobile_ads.dart';
+import 'package:http/http.dart' as http;
 import 'package:share_plus/share_plus.dart';
 import '../models/article.dart';
 import '../screens/article_screen.dart';
+import '../services/ad_service.dart';
 import 'article_webview.dart';
 
 class NewsReelCard extends StatefulWidget {
@@ -29,6 +32,55 @@ class _NewsReelCardState extends State<NewsReelCard>
   late AnimationController _slideController;
   late Animation<Offset> _slideAnim;
   late Animation<double> _fadeAnim;
+
+  // Interstitial ad — preloaded, shown once when article is opened
+  InterstitialAd? _interstitial;
+  static int _articleOpenCount = 0; // show ad every 3 article opens
+
+  // OG image cache — fetched lazily when no real RSS thumbnail available
+  static final Map<String, String?> _ogCache = {};
+  String? _ogImage; // fetched OG image for this article
+
+  void _preloadInterstitial() {
+    AdService.loadInterstitial(onLoaded: (ad) {
+      _interstitial = ad;
+    });
+  }
+
+  // Fetch the article page's og:image when no real RSS thumbnail is available
+  Future<void> _fetchOgImage() async {
+    if (!widget.article.aiImage) return; // already has a real RSS image
+    final url = widget.article.link;
+    if (url.isEmpty) return;
+    if (_ogCache.containsKey(url)) {
+      if (mounted && _ogCache[url] != null) {
+        setState(() => _ogImage = _ogCache[url]);
+      }
+      return;
+    }
+    try {
+      final resp = await http.get(Uri.parse(url),
+          headers: {'Accept': 'text/html'}).timeout(const Duration(seconds: 6));
+      final body = resp.body;
+      // Try og:image first, then twitter:image
+      final ogMatch = RegExp(
+        r'''<meta[^>]+property=["']og:image["'][^>]+content=["'](https?://[^"']+)["']''',
+        caseSensitive: false,
+      ).firstMatch(body) ?? RegExp(
+        r'''<meta[^>]+content=["'](https?://[^"']+)["'][^>]+property=["']og:image["']''',
+        caseSensitive: false,
+      ).firstMatch(body) ?? RegExp(
+        r'''<meta[^>]+name=["']twitter:image["'][^>]+content=["'](https?://[^"']+)["']''',
+        caseSensitive: false,
+      ).firstMatch(body);
+      final img = ogMatch?.group(1);
+      _ogCache[url] = img;
+      if (mounted && img != null) setState(() => _ogImage = img);
+    } catch (_) {
+      _ogCache[url] = null;
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -49,7 +101,11 @@ class _NewsReelCardState extends State<NewsReelCard>
     );
     if (widget.isActive) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) _slideController.forward(from: 0);
+        if (mounted) {
+          _slideController.forward(from: 0);
+          _preloadInterstitial();
+          _fetchOgImage();
+        }
       });
     }
   }
@@ -59,12 +115,15 @@ class _NewsReelCardState extends State<NewsReelCard>
     super.didUpdateWidget(oldWidget);
     if (widget.isActive && !oldWidget.isActive) {
       _slideController.forward(from: 0);
+      if (_interstitial == null) _preloadInterstitial();
+      _fetchOgImage();
     }
   }
 
   @override
   void dispose() {
     _slideController.dispose();
+    _interstitial?.dispose();
     super.dispose();
   }
 
@@ -74,6 +133,29 @@ class _NewsReelCardState extends State<NewsReelCard>
       _isAr ? TextDirection.rtl : TextDirection.ltr;
 
   Future<void> _openArticle() async {
+    _articleOpenCount++;
+    // Show interstitial every 3 article opens
+    if (_articleOpenCount % 3 == 0 && _interstitial != null) {
+      _interstitial!.fullScreenContentCallback = FullScreenContentCallback(
+        onAdDismissedFullScreenContent: (ad) {
+          ad.dispose();
+          _interstitial = null;
+          _preloadInterstitial(); // preload next one
+          if (mounted) _navigateToArticle();
+        },
+        onAdFailedToShowFullScreenContent: (ad, _) {
+          ad.dispose();
+          _interstitial = null;
+          if (mounted) _navigateToArticle();
+        },
+      );
+      await _interstitial!.show();
+    } else {
+      _navigateToArticle();
+    }
+  }
+
+  void _navigateToArticle() {
     Navigator.push(
       context,
       PageRouteBuilder(
@@ -142,12 +224,35 @@ class _NewsReelCardState extends State<NewsReelCard>
   }
 
   Widget _buildBackground(Article article) {
-    if (article.image != null && article.image!.isNotEmpty) {
+    // Priority: fetched OG image > real RSS image > fallback gradient
+    final imageUrl = _ogImage ??
+        (!article.aiImage && article.image != null && article.image!.isNotEmpty
+            ? article.image
+            : null);
+    if (imageUrl != null) {
+      return ColoredBox(
+        color: Colors.black,
+        child: CachedNetworkImage(
+          imageUrl: imageUrl,
+          fit: BoxFit.cover,
+          alignment: Alignment.center,
+          fadeInDuration: const Duration(milliseconds: 300),
+          placeholder: (_, __) => _fallbackBackground(article),
+          errorWidget: (_, __, ___) => _buildBackground_fallbackOrAi(article),
+        ),
+      );
+    }
+    return _fallbackBackground(article);
+  }
+
+  // When real/OG image fails, try AI image before falling back to gradient
+  Widget _buildBackground_fallbackOrAi(Article article) {
+    if (article.aiImage && article.image != null && article.image!.isNotEmpty) {
       return ColoredBox(
         color: Colors.black,
         child: CachedNetworkImage(
           imageUrl: article.image!,
-          fit: BoxFit.contain,
+          fit: BoxFit.cover,
           alignment: Alignment.center,
           fadeInDuration: const Duration(milliseconds: 300),
           placeholder: (_, __) => _fallbackBackground(article),
