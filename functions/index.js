@@ -215,7 +215,17 @@ function isArabicText(str) {
 function itemToArticle(item, feed) {
   let title = cleanText(item.title);
   if (feed.gnews) title = parseGNewsTitle(title).title;
-  const rawDesc = cleanText(item.contentSnippet || item.description || "");
+  // RT Arabic RSS embeds a multi-story digest in description, not the article's own text.
+  // Detected by "Stories N" preamble or "مشاهدة RT" separators between stories.
+  let rawInput = item.contentSnippet || item.description || "";
+  if (/^\s*Stories\s+\d+/i.test(rawInput)) {
+    rawInput = "";
+  } else {
+    // Truncate at RT-style per-story navigation separator
+    const navIdx = rawInput.search(/مشاهدة\s+RT/i);
+    if (navIdx > 0) rawInput = rawInput.substring(0, navIdx).trim();
+  }
+  const rawDesc = cleanText(rawInput);
   // Drop description if it's just leftover boilerplate (< 20 chars after cleaning)
   const desc = rawDesc.length >= 20 ? truncateAtSentence(rawDesc, 220) : "";
   const lang = feed.lang || (isArabicText(title) ? "ar" : "en");
